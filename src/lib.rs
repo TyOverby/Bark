@@ -76,7 +76,7 @@ impl <T: ?Sized> BarkSend<T> {
 }
 
 unsafe impl <T: ?Sized + Sync> Sync for Bark<T> {}
-unsafe impl <T: ?Sized + Sync + Send> Send for Bark<T> {}
+unsafe impl <T: ?Sized + Sync + Send> Send for BarkSend<T> {}
 
 impl <T: ?Sized> Clone for Bark<T> {
     fn clone(&self) -> Bark<T> {
