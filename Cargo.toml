@@ -1,0 +1,6 @@
+[package]
+name = "bark"
+version = "0.1.0"
+authors = ["Ty Overby <ty@pre-alpha.com>"]
+
+[dependencies]
