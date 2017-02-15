@@ -4,31 +4,41 @@ use std::ptr::Shared;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::Cell;
 
+/// A Bark Pointer.
+///
+/// In order to send a Bark<T> across threads, you must first aquire a BarkSend by calling `sendable()` on your `Bark`.
 pub struct Bark<T: ?Sized> {
+    // Thread-local ref count
     thread: Shared<Cell<usize>>,
     inner: Shared<BarkInner<T>>,
 }
 
 struct BarkInner<T: ?Sized> {
+    // Cross-thread ref count
     cross: AtomicUsize,
+    // Possibly unsized value
     value: T,
 }
 
-pub struct BarkSend<T: ?Sized> {
+/// A Bark Pointer that can be sent across threads.
+///
+///In order to use this value again, call the `promote()` method.
+pub struct BarkSend<T: ?Sized + Send + Sync> {
     inner: Shared<BarkInner<T>>,
 }
 
 impl <T: ?Sized> BarkInner<T> {
-    fn mod_cross(&self, p: isize) -> usize {
-        if p < 0 {
-            self.cross.fetch_sub(-p as usize, Ordering::Release)
-        } else {
-            self.cross.fetch_add(p as usize, Ordering::Release)
-        }
+    fn incr_cross(&self) -> usize {
+        self.cross.fetch_add(1 as usize, Ordering::Release)
+    }
+
+    fn decr_cross(&self) -> usize {
+        self.cross.fetch_sub(1 as usize, Ordering::Release)
     }
 }
 
 impl <T: ?Sized> Bark<T> {
+    /// Create a new Bark
     pub fn new(value: T) -> Bark<T> where T: Sized {
         let thread = Box::new(Cell::new(1usize));
         let inner = Box::new(BarkInner {
@@ -44,25 +54,34 @@ impl <T: ?Sized> Bark<T> {
         }
     }
 
-    pub fn sendable(&self) -> BarkSend<T> {
-        unsafe{&**self.inner}.mod_cross(1);
+    /// Creates a BarkSend which can be sent across thread boundaries
+    pub fn sendable(&self) -> BarkSend<T> where T: Send + Sync{
+        unsafe{&**self.inner}.incr_cross();
         BarkSend {
             inner: self.inner.clone()
         }
     }
 
-    fn mod_thread(&self, p: isize) -> usize {
-        unsafe { 
+    fn decr_thread(&self) -> usize {
+        unsafe {
             let prev = self.thread.as_ref().unwrap().get();
-            let new = (prev as isize + p as isize) as usize;
+            let new = prev - 1;
             self.thread.as_mut().unwrap().set(new);
-            new
+            prev
         }
     }
 
+    fn incr_thread(&self) {
+        unsafe {
+            let prev = self.thread.as_ref().unwrap().get();
+            let new = prev + 1;
+            self.thread.as_mut().unwrap().set(new);
+        }
+    }
 }
 
-impl <T: ?Sized> BarkSend<T> {
+impl <T: ?Sized + Send + Sync> BarkSend<T> {
+    /// Turns a `BarkSend<T>` back into a `Bark<T>`
     pub fn promote(self) -> Bark<T> {
         let thread = Box::new(Cell::new(1usize));
 
@@ -80,7 +99,7 @@ unsafe impl <T: ?Sized + Sync + Send> Send for Bark<T> {}
 
 impl <T: ?Sized> Clone for Bark<T> {
     fn clone(&self) -> Bark<T> {
-        self.mod_thread(1);
+        self.incr_thread();
         Bark {
             thread: self.thread.clone(),
             inner: self.inner.clone(),
@@ -92,16 +111,13 @@ impl <T: ?Sized> Drop for Bark<T> {
     fn drop(&mut self) {
         use std::mem::drop;
         // If we are the last Bark on this thread
-        if self.mod_thread(-1) == 0 {
+        if self.decr_thread() == 1 {
             unsafe {
                 // deallocate
                 drop(Box::from_raw(*self.thread));
-            }
 
-            
-            // If we are the last Bark in the universe
-            if unsafe {&**self.inner}.mod_cross(-1) == 0 {
-                unsafe {
+                // If we are the last Bark in the universe
+                if (&**self.inner).decr_cross() == 1 {
                     drop(Box::from_raw(*self.inner));
                 }
             }
@@ -109,11 +125,11 @@ impl <T: ?Sized> Drop for Bark<T> {
     }
 }
 
-impl <T: ?Sized> Drop for BarkSend<T> {
+impl <T: ?Sized + Send + Sync> Drop for BarkSend<T> {
     fn drop(&mut self) {
-        // If we are the last Bark in the universe
-        if (unsafe {&**self.inner}).mod_cross(-1) == 0 {
-            unsafe {
+        unsafe {
+            // If we are the last Bark in the universe
+            if (&**self.inner).decr_cross() == 1 {
                 drop(Box::from_raw(*self.inner));
             }
         }
