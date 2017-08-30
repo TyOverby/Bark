@@ -1,3 +1,10 @@
+## IMPORTANT
+
+Bark has not been audited by smart people yet.  Use at your own peril!
+
+Bark is up for adoption; if you or someone you know wants to pick up this project, 
+please let me know!
+
 ## What is Bark?
 
 `Bark<T>` is a pointer type for reference-counted data similar to `Arc<T>` or `Rc<T>`.
