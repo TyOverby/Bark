@@ -1,8 +1,8 @@
 #![feature(shared)]
 
+use std::cell::Cell;
 use std::ptr::Shared;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::cell::Cell;
 
 /// A Bark Pointer.
 ///
@@ -27,7 +27,7 @@ pub struct BarkSend<T: ?Sized + Send + Sync> {
     inner: Shared<BarkInner<T>>,
 }
 
-impl <T: ?Sized> BarkInner<T> {
+impl<T: ?Sized> BarkInner<T> {
     fn incr_cross(&self) -> usize {
         self.cross.fetch_add(1 as usize, Ordering::Release)
     }
@@ -37,16 +37,19 @@ impl <T: ?Sized> BarkInner<T> {
     }
 }
 
-impl <T: ?Sized> Bark<T> {
+impl<T: ?Sized> Bark<T> {
     /// Create a new Bark
-    pub fn new(value: T) -> Bark<T> where T: Sized {
+    pub fn new(value: T) -> Bark<T>
+    where
+        T: Sized,
+    {
         let thread = Box::new(Cell::new(1usize));
         let inner = Box::new(BarkInner {
             cross: AtomicUsize::new(1usize),
             value: value,
         });
 
-        unsafe { 
+        unsafe {
             Bark {
                 thread: Shared::new(Box::into_raw(thread)),
                 inner: Shared::new(Box::into_raw(inner)),
@@ -55,10 +58,13 @@ impl <T: ?Sized> Bark<T> {
     }
 
     /// Creates a BarkSend which can be sent across thread boundaries
-    pub fn sendable(&self) -> BarkSend<T> where T: Send + Sync{
-        unsafe{&**self.inner}.incr_cross();
+    pub fn sendable(&self) -> BarkSend<T>
+    where
+        T: Send + Sync,
+    {
+        unsafe { &**self.inner }.incr_cross();
         BarkSend {
-            inner: self.inner.clone()
+            inner: self.inner.clone(),
         }
     }
 
@@ -80,7 +86,7 @@ impl <T: ?Sized> Bark<T> {
     }
 }
 
-impl <T: ?Sized + Send + Sync> BarkSend<T> {
+impl<T: ?Sized + Send + Sync> BarkSend<T> {
     /// Turns a `BarkSend<T>` back into a `Bark<T>`
     pub fn promote(self) -> Bark<T> {
         let thread = Box::new(Cell::new(1usize));
@@ -94,10 +100,10 @@ impl <T: ?Sized + Send + Sync> BarkSend<T> {
     }
 }
 
-unsafe impl <T: ?Sized + Sync> Sync for Bark<T> {}
-unsafe impl <T: ?Sized + Sync + Send> Send for BarkSend<T> {}
+unsafe impl<T: ?Sized + Sync> Sync for Bark<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Send for BarkSend<T> {}
 
-impl <T: ?Sized> Clone for Bark<T> {
+impl<T: ?Sized> Clone for Bark<T> {
     fn clone(&self) -> Bark<T> {
         self.incr_thread();
         Bark {
@@ -107,7 +113,7 @@ impl <T: ?Sized> Clone for Bark<T> {
     }
 }
 
-impl <T: ?Sized> Drop for Bark<T> {
+impl<T: ?Sized> Drop for Bark<T> {
     fn drop(&mut self) {
         use std::mem::drop;
         // If we are the last Bark on this thread
@@ -125,7 +131,7 @@ impl <T: ?Sized> Drop for Bark<T> {
     }
 }
 
-impl <T: ?Sized + Send + Sync> Drop for BarkSend<T> {
+impl<T: ?Sized + Send + Sync> Drop for BarkSend<T> {
     fn drop(&mut self) {
         unsafe {
             // If we are the last Bark in the universe
@@ -141,8 +147,6 @@ impl<T: ?Sized> std::ops::Deref for Bark<T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        unsafe {
-            &((**self.inner).value)
-        }
+        unsafe { &((**self.inner).value) }
     }
 }
