@@ -1,16 +1,18 @@
-#![feature(shared)]
-
-use std::cell::Cell;
-use std::ptr::Shared;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    cell::Cell,
+    mem,
+    pin::Pin,
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 /// A Bark Pointer.
 ///
 /// In order to send a Bark<T> across threads, you must first aquire a BarkSend by calling `sendable()` on your `Bark`.
 pub struct Bark<T: ?Sized> {
     // Thread-local ref count
-    thread: Shared<Cell<usize>>,
-    inner: Shared<BarkInner<T>>,
+    thread: NonNull<Cell<usize>>,
+    inner: NonNull<BarkInner<T>>,
 }
 
 struct BarkInner<T: ?Sized> {
@@ -22,9 +24,9 @@ struct BarkInner<T: ?Sized> {
 
 /// A Bark Pointer that can be sent across threads.
 ///
-///In order to use this value again, call the `promote()` method.
+/// In order to use this value again, call the `promote()` method.
 pub struct BarkSend<T: ?Sized + Send + Sync> {
-    inner: Shared<BarkInner<T>>,
+    inner: NonNull<BarkInner<T>>,
 }
 
 impl<T: ?Sized> BarkInner<T> {
@@ -49,10 +51,11 @@ impl<T: ?Sized> Bark<T> {
             value: value,
         });
 
+        // TODO: When `Box::into_raw_non_null` is stabilized, switch over.
         unsafe {
             Bark {
-                thread: Shared::new(Box::into_raw(thread)),
-                inner: Shared::new(Box::into_raw(inner)),
+                thread: NonNull::new_unchecked(Box::into_raw(thread)),
+                inner: NonNull::new_unchecked(Box::into_raw(inner)),
             }
         }
     }
@@ -62,7 +65,7 @@ impl<T: ?Sized> Bark<T> {
     where
         T: Send + Sync,
     {
-        unsafe { &**self.inner }.incr_cross();
+        unsafe { self.inner.as_ref() }.incr_cross();
         BarkSend {
             inner: self.inner.clone(),
         }
@@ -70,19 +73,27 @@ impl<T: ?Sized> Bark<T> {
 
     fn decr_thread(&self) -> usize {
         unsafe {
-            let prev = self.thread.as_ref().unwrap().get();
+            let prev = self.thread.as_ref().get();
             let new = prev - 1;
-            self.thread.as_mut().unwrap().set(new);
+            self.thread.as_ref().set(new);
             prev
         }
     }
 
     fn incr_thread(&self) {
         unsafe {
-            let prev = self.thread.as_ref().unwrap().get();
+            let prev = self.thread.as_ref().get();
             let new = prev + 1;
-            self.thread.as_mut().unwrap().set(new);
+            self.thread.as_ref().set(new);
         }
+    }
+}
+
+impl<T> Bark<T> {
+    /// Constructs a new `Pin<Bark<T>>`. If `T` does not implement `Unpin`,
+    /// then `data` will be pinned in memory and unable to be moved.
+    pub fn pin(data: T) -> Pin<Bark<T>> {
+        unsafe { Pin::new_unchecked(Bark::new(data)) }
     }
 }
 
@@ -93,7 +104,7 @@ impl<T: ?Sized + Send + Sync> BarkSend<T> {
 
         unsafe {
             Bark {
-                thread: Shared::new(Box::into_raw(thread)),
+                thread: NonNull::new_unchecked(Box::into_raw(thread)),
                 inner: self.inner.clone(),
             }
         }
@@ -115,16 +126,15 @@ impl<T: ?Sized> Clone for Bark<T> {
 
 impl<T: ?Sized> Drop for Bark<T> {
     fn drop(&mut self) {
-        use std::mem::drop;
         // If we are the last Bark on this thread
         if self.decr_thread() == 1 {
             unsafe {
                 // deallocate
-                drop(Box::from_raw(*self.thread));
+                mem::drop(Box::from_raw(self.thread.as_ptr()));
 
                 // If we are the last Bark in the universe
-                if (&**self.inner).decr_cross() == 1 {
-                    drop(Box::from_raw(*self.inner));
+                if self.inner.as_ref().decr_cross() == 1 {
+                    mem::drop(Box::from_raw(self.inner.as_ptr()));
                 }
             }
         }
@@ -135,8 +145,8 @@ impl<T: ?Sized + Send + Sync> Drop for BarkSend<T> {
     fn drop(&mut self) {
         unsafe {
             // If we are the last Bark in the universe
-            if (&**self.inner).decr_cross() == 1 {
-                drop(Box::from_raw(*self.inner));
+            if self.inner.as_ref().decr_cross() == 1 {
+                mem::drop(Box::from_raw(self.inner.as_ptr()));
             }
         }
     }
@@ -147,6 +157,6 @@ impl<T: ?Sized> std::ops::Deref for Bark<T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        unsafe { &((**self.inner).value) }
+        unsafe { &self.inner.as_ref().value }
     }
 }
