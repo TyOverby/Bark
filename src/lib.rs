@@ -36,9 +36,9 @@ struct BarkInner<T: ?Sized> {
     value: T,
 }
 
-/// A Bark Pointer that can be sent across threads.
-///
-/// In order to use this value again, call the `promote()` method.
+/// A thead-safe `Bark` pointer. Unlike `Bark<T>`, `BarkSend<T>` is both `Send` and `Sync`; however, cloning it
+/// incurs the same overhead as an `Arc<T>`, with its atomic reference count. For lots of cloning and destroying of
+/// references, prefer `Bark<T>` over `BarkSend<T>`, and use `BarkSend<T>` only when you need a cross-thread structure.
 pub struct BarkSend<T: ?Sized> {
     inner: NonNull<BarkInner<T>>,
     _phantom: PhantomData<BarkInner<T>>,
@@ -46,6 +46,10 @@ pub struct BarkSend<T: ?Sized> {
 
 /// A thread-local `Bark` pointer. `Bark<T>` is never `Send` or `Sync`; in order to get a `Send` or `Sync` version,
 /// it must be made into a `BarkSend` through the `Bark::send` associated function.
+///
+/// The reason that `Bark` cannot be `Send` or `Sync` lies in its `Clone` behavior; if `Bark` were `Sync`, then it
+/// would be possible to clone a `Bark` in one thread from another thread, which invalidates Rust's memory model
+/// w.r.t. the non-`Sync` storage used to deal with the thread-local reference count.
 impl<T: ?Sized> Bark<T> {
     /// Create a new Bark.
     #[inline]
