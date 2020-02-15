@@ -1,9 +1,17 @@
+//! `Bark` is a smart pointer which allows its data to cross threads while maintaining
+//! fast, non-atomic thread-local reference counts.
+//!
+//! It does this by using a `Bark` type with a non-local
+
 #![feature(dropck_eyepatch, cell_update)]
+#![warn(missing_docs)]
 
 use std::{
     alloc::{self, Layout},
     cell::Cell,
-    fmt, mem,
+    fmt,
+    marker::PhantomData,
+    mem,
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::{self, AtomicUsize, Ordering},
@@ -18,6 +26,7 @@ pub struct Bark<T: ?Sized> {
     // Thread-local ref count
     thread: NonNull<Cell<usize>>,
     inner: NonNull<BarkInner<T>>,
+    _phantom: PhantomData<BarkInner<T>>,
 }
 
 struct BarkInner<T: ?Sized> {
@@ -32,8 +41,11 @@ struct BarkInner<T: ?Sized> {
 /// In order to use this value again, call the `promote()` method.
 pub struct BarkSend<T: ?Sized> {
     inner: NonNull<BarkInner<T>>,
+    _phantom: PhantomData<BarkInner<T>>,
 }
 
+/// A thread-local `Bark` pointer. `Bark<T>` is never `Send` or `Sync`; in order to get a `Send` or `Sync` version,
+/// it must be made into a `BarkSend` through the `Bark::send` associated function.
 impl<T: ?Sized> Bark<T> {
     /// Create a new Bark.
     #[inline]
@@ -44,7 +56,7 @@ impl<T: ?Sized> Bark<T> {
         let thread = Box::new(Cell::new(1usize));
         let inner = Box::new(BarkInner {
             cross: AtomicUsize::new(1usize),
-            value: value,
+            value,
         });
 
         // TODO: When `Box::into_raw_non_null` is stabilized, switch over.
@@ -52,13 +64,17 @@ impl<T: ?Sized> Bark<T> {
             Bark {
                 thread: NonNull::new_unchecked(Box::into_raw(thread)),
                 inner: NonNull::new_unchecked(Box::into_raw(inner)),
+                _phantom: PhantomData,
             }
         }
     }
 
-    /// Creates a BarkSend which can be sent across thread boundaries.
+    /// Creates a `BarkSend<T>` which can be sent across thread boundaries. `Bark<T>` is to `Rc<T>`
+    /// what `BarkSend<T>` is to `Arc<T>`, with the crucial difference that `Bark<T>` can be
+    /// converted to a `BarkSend<T>` through `make_send` without any sort of cloning of the inner
+    /// data.
     #[inline]
-    pub fn sendable(&self) -> BarkSend<T>
+    pub fn make_send(this: &Self) -> BarkSend<T>
     where
         T: Send + Sync,
     {
@@ -75,7 +91,7 @@ impl<T: ?Sized> Bark<T> {
         // is also significant, but only in that if we have 0 outside
         // of the situation in `Drop` or `try_unwrap`, something has gone
         // HORRIBLY wrong...
-        let old = self.inner().cross.fetch_add(1, Ordering::Relaxed);
+        let old = this.inner().cross.fetch_add(1, Ordering::Relaxed);
 
         // Oh, we do have to account for possible overflows, though.
         // The maximum refcount is `isize::max_value()`, matching with the std `Arc` limit.
@@ -85,10 +101,12 @@ impl<T: ?Sized> Bark<T> {
         }
 
         BarkSend {
-            inner: self.inner.clone(),
+            inner: this.inner.clone(),
+            _phantom: PhantomData,
         }
     }
 
+    /// Returns true if both the thread-local and cross-thread reference counts are 1.
     #[inline]
     pub fn is_unique(&mut self) -> bool {
         // The `Acquire` ordering on this load ensures that we're seeing an up-to-date
@@ -106,6 +124,9 @@ impl<T: ?Sized> Bark<T> {
         unsafe { self.inner.as_ref() }
     }
 
+    /// If there are no other references to this `Bark`, whether thread-local or cross-thread,
+    /// then we can safely get a mutable reference to the inner value and `get_mut` will return
+    /// `Some`. If this `Bark` is non-unique, then this function returns `None`.
     #[inline]
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
         if this.is_unique() {
@@ -115,6 +136,8 @@ impl<T: ?Sized> Bark<T> {
         }
     }
 
+    /// Get a mutable reference to the inner value without checking the reference counts. This
+    /// is highly unsafe.
     #[inline]
     pub unsafe fn get_mut_unchecked(this: &mut Self) -> &mut T {
         &mut this.inner.as_mut().value
@@ -134,18 +157,10 @@ impl<T> Bark<T> {
     pub fn pin(data: T) -> Pin<Bark<T>> {
         unsafe { Pin::new_unchecked(Bark::new(data)) }
     }
-}
 
-impl<T: Clone> Bark<T> {
-    #[inline]
-    pub fn make_mut(this: &mut Self) -> &mut T {
-        if !this.is_unique() {
-            *this = Bark::new((**this).clone());
-        }
-
-        unsafe { Self::get_mut_unchecked(this) }
-    }
-
+    /// Try to extract the inner value from this `Bark` without cloning it. If the `Bark` is
+    /// unique, then destroy the allocated `Bark`, move the inner value out and return it.
+    /// Otherwise we return the `Bark<T>`.
     #[inline]
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         // `drop` contains an explanation of the atomics. The
@@ -224,6 +239,20 @@ impl<T: Clone> Bark<T> {
     }
 }
 
+impl<T: Clone> Bark<T> {
+    /// Similar to `Bark::get_mut`, but in the case that the `Bark` is non-unique,
+    /// clone the inner data and make a new `Bark` out of it, with which we overwrite
+    /// `this`. This is a nice primitive for clone-on-write behavior.
+    #[inline]
+    pub fn make_mut(this: &mut Self) -> &mut T {
+        if !this.is_unique() {
+            *this = Bark::new((**this).clone());
+        }
+
+        unsafe { Self::get_mut_unchecked(this) }
+    }
+}
+
 impl<T: ?Sized> BarkSend<T> {
     /// Turns a `BarkSend<T>` back into a `Bark<T>`.
     #[inline]
@@ -234,6 +263,7 @@ impl<T: ?Sized> BarkSend<T> {
             Bark {
                 thread: NonNull::new_unchecked(Box::into_raw(thread)),
                 inner: self.inner.clone(),
+                _phantom: PhantomData,
             }
         }
     }
@@ -245,8 +275,8 @@ impl<T: ?Sized> BarkSend<T> {
     }
 }
 
-unsafe impl<T: ?Sized + Sync> Sync for Bark<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Send for BarkSend<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Sync for BarkSend<T> {}
 
 impl<T: ?Sized> Clone for Bark<T> {
     #[inline]
@@ -264,6 +294,26 @@ impl<T: ?Sized> Clone for Bark<T> {
         Bark {
             thread: self.thread,
             inner: self.inner,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// `BarkSend` implements `Clone` too, and for this, it's basically an `Arc`. While
+/// it can be cloned, its clone is an atomic operation and is way slower than `Bark`'s
+/// clone because of that.
+impl<T: ?Sized> Clone for BarkSend<T> {
+    #[inline]
+    fn clone(&self) -> BarkSend<T> {
+        // Avoid overflowing by using `isize::max_value()` as our maximum reference
+        // count, because no sane program should be anywhere near that number.
+        if self.inner().cross.fetch_add(1, Ordering::Relaxed) > MAX_REFCOUNT {
+            ::std::process::abort();
+        }
+
+        BarkSend {
+            inner: self.inner,
+            _phantom: PhantomData,
         }
     }
 }
