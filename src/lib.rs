@@ -21,7 +21,7 @@ const MAX_REFCOUNT: usize = isize::max_value() as usize;
 
 /// A Bark Pointer.
 ///
-/// In order to send a Bark<T> across threads, you must first aquire a BarkSend by calling `sendable()` on your `Bark`.
+/// In order to send a Bark<T> across threads, you must first aquire a AtomicBark by calling `sendable()` on your `Bark`.
 pub struct Bark<T: ?Sized> {
     // Thread-local ref count
     thread: NonNull<Cell<usize>>,
@@ -36,16 +36,16 @@ struct BarkInner<T: ?Sized> {
     value: T,
 }
 
-/// A thead-safe `Bark` pointer. Unlike `Bark<T>`, `BarkSend<T>` is both `Send` and `Sync`; however, cloning it
+/// A thead-safe `Bark` pointer. Unlike `Bark<T>`, `AtomicBark<T>` is both `Send` and `Sync`; however, cloning it
 /// incurs the same overhead as an `Arc<T>`, with its atomic reference count. For lots of cloning and destroying of
-/// references, prefer `Bark<T>` over `BarkSend<T>`, and use `BarkSend<T>` only when you need a cross-thread structure.
-pub struct BarkSend<T: ?Sized> {
+/// references, prefer `Bark<T>` over `AtomicBark<T>`, and use `AtomicBark<T>` only when you need a cross-thread structure.
+pub struct AtomicBark<T: ?Sized> {
     inner: NonNull<BarkInner<T>>,
     _phantom: PhantomData<BarkInner<T>>,
 }
 
 /// A thread-local `Bark` pointer. `Bark<T>` is never `Send` or `Sync`; in order to get a `Send` or `Sync` version,
-/// it must be made into a `BarkSend` through the `Bark::send` associated function.
+/// it must be made into a `AtomicBark` through the `Bark::send` associated function.
 ///
 /// The reason that `Bark` cannot be `Send` or `Sync` lies in its `Clone` behavior; if `Bark` were `Sync`, then it
 /// would be possible to clone a `Bark` in one thread from another thread, which invalidates Rust's memory model
@@ -73,12 +73,12 @@ impl<T: ?Sized> Bark<T> {
         }
     }
 
-    /// Creates a `BarkSend<T>` which can be sent across thread boundaries. `Bark<T>` is to `Rc<T>`
-    /// what `BarkSend<T>` is to `Arc<T>`, with the crucial difference that `Bark<T>` can be
-    /// converted to a `BarkSend<T>` through `make_send` without any sort of cloning of the inner
+    /// Creates a `AtomicBark<T>` which can be sent across thread boundaries. `Bark<T>` is to `Rc<T>`
+    /// what `AtomicBark<T>` is to `Arc<T>`, with the crucial difference that `Bark<T>` can be
+    /// converted to a `AtomicBark<T>` through `clone_atomic` without any sort of cloning of the inner
     /// data.
     #[inline]
-    pub fn make_send(this: &Self) -> BarkSend<T>
+    pub fn clone_atomic(&self) -> AtomicBark<T>
     where
         T: Send + Sync,
     {
@@ -95,7 +95,7 @@ impl<T: ?Sized> Bark<T> {
         // is also significant, but only in that if we have 0 outside
         // of the situation in `Drop` or `try_unwrap`, something has gone
         // HORRIBLY wrong...
-        let old = this.inner().cross.fetch_add(1, Ordering::Relaxed);
+        let old = self.inner().cross.fetch_add(1, Ordering::Relaxed);
 
         // Oh, we do have to account for possible overflows, though.
         // The maximum refcount is `isize::max_value()`, matching with the std `Arc` limit.
@@ -104,8 +104,8 @@ impl<T: ?Sized> Bark<T> {
             ::std::process::abort();
         }
 
-        BarkSend {
-            inner: this.inner.clone(),
+        AtomicBark {
+            inner: self.inner.clone(),
             _phantom: PhantomData,
         }
     }
@@ -255,10 +255,16 @@ impl<T: Clone> Bark<T> {
 
         unsafe { Self::get_mut_unchecked(this) }
     }
+
+    /// Similar to `try_unwrap`, but if we can't unwrap the value, we clone it.
+    #[inline]
+    pub fn unwrap_or_clone(this: Self) -> T {
+        Bark::try_unwrap(this).unwrap_or_else(|bark| (*bark).clone())
+    }
 }
 
-impl<T: ?Sized> BarkSend<T> {
-    /// Turns a `BarkSend<T>` back into a `Bark<T>`.
+impl<T: ?Sized> AtomicBark<T> {
+    /// Turns a `AtomicBark<T>` back into a `Bark<T>`.
     #[inline]
     pub fn promote(self) -> Bark<T> {
         let thread = Box::new(Cell::new(1usize));
@@ -279,8 +285,36 @@ impl<T: ?Sized> BarkSend<T> {
     }
 }
 
-unsafe impl<T: ?Sized + Sync + Send> Send for BarkSend<T> {}
-unsafe impl<T: ?Sized + Sync + Send> Sync for BarkSend<T> {}
+impl<T: ?Sized> Unpin for Bark<T> {}
+impl<T: ?Sized> Unpin for AtomicBark<T> {}
+
+unsafe impl<T: ?Sized + Sync + Send> Send for AtomicBark<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Sync for AtomicBark<T> {}
+
+impl<T> AtomicBark<T> {
+    /// Create a new `AtomicBark`.
+    pub fn new(value: T) -> AtomicBark<T> {
+        let inner = Box::new(BarkInner {
+            cross: AtomicUsize::new(1usize),
+            value,
+        });
+
+        // TODO: When `Box::into_raw_non_null` is stabilized, switch over.
+        unsafe {
+            AtomicBark {
+                inner: NonNull::new_unchecked(Box::into_raw(inner)),
+                _phantom: PhantomData,
+            }
+        }
+    }
+
+    /// Constructs a new `Pin<Bark<T>>`. If `T` does not implement `Unpin`,
+    /// then `data` will be pinned in memory and unable to be moved.
+    #[inline]
+    pub fn pin(data: T) -> Pin<AtomicBark<T>> {
+        unsafe { Pin::new_unchecked(AtomicBark::new(data)) }
+    }
+}
 
 impl<T: ?Sized> Clone for Bark<T> {
     #[inline]
@@ -303,19 +337,19 @@ impl<T: ?Sized> Clone for Bark<T> {
     }
 }
 
-/// `BarkSend` implements `Clone` too, and for this, it's basically an `Arc`. While
+/// `AtomicBark` implements `Clone` too, and for this, it's basically an `Arc`. While
 /// it can be cloned, its clone is an atomic operation and is way slower than `Bark`'s
 /// clone because of that.
-impl<T: ?Sized> Clone for BarkSend<T> {
+impl<T: ?Sized> Clone for AtomicBark<T> {
     #[inline]
-    fn clone(&self) -> BarkSend<T> {
+    fn clone(&self) -> AtomicBark<T> {
         // Avoid overflowing by using `isize::max_value()` as our maximum reference
         // count, because no sane program should be anywhere near that number.
         if self.inner().cross.fetch_add(1, Ordering::Relaxed) > MAX_REFCOUNT {
             ::std::process::abort();
         }
 
-        BarkSend {
+        AtomicBark {
             inner: self.inner,
             _phantom: PhantomData,
         }
@@ -377,7 +411,7 @@ unsafe impl<#[may_dangle] T: ?Sized> Drop for Bark<T> {
     }
 }
 
-unsafe impl<#[may_dangle] T: ?Sized> Drop for BarkSend<T> {
+unsafe impl<#[may_dangle] T: ?Sized> Drop for AtomicBark<T> {
     #[inline]
     fn drop(&mut self) {
         // If we are the last Bark in the universe
@@ -404,7 +438,7 @@ impl<T: ?Sized> std::ops::Deref for Bark<T> {
     }
 }
 
-impl<T: ?Sized> std::ops::Deref for BarkSend<T> {
+impl<T: ?Sized> std::ops::Deref for AtomicBark<T> {
     type Target = T;
 
     #[inline]
@@ -420,9 +454,21 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Bark<T> {
     }
 }
 
-impl<T: ?Sized + fmt::Debug> fmt::Debug for BarkSend<T> {
+impl<T: ?Sized + fmt::Debug> fmt::Debug for AtomicBark<T> {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         (**self).fmt(f)
+    }
+}
+
+impl<T> From<T> for Bark<T> {
+    fn from(t: T) -> Self {
+        Bark::new(t)
+    }
+}
+
+impl<T> From<T> for AtomicBark<T> {
+    fn from(t: T) -> Self {
+        AtomicBark::new(t)
     }
 }
