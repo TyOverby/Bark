@@ -319,15 +319,11 @@ impl<T> AtomicBark<T> {
 impl<T: ?Sized> Clone for Bark<T> {
     #[inline]
     fn clone(&self) -> Bark<T> {
-        let thread = self.thread().get();
-
         // We do *not* want to overflow this. Look, if you have this many
         // `Bark`s floating around, what *are* you doing? Wtf.
         if self.thread().update(|i| i + 1) > MAX_REFCOUNT {
             ::std::process::abort();
         }
-
-        self.thread().set(thread + 1);
 
         Bark {
             thread: self.thread,
