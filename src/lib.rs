@@ -355,6 +355,7 @@ impl<T: ?Sized> Clone for AtomicBark<T> {
 unsafe impl<#[may_dangle] T: ?Sized> Drop for Bark<T> {
     #[inline]
     fn drop(&mut self) {
+        // Unlike `fetch_xxx`, `Cell::update` returns the new value, not the old.
         if self.thread().update(|i| i - 1) != 0 {
             return;
         }
