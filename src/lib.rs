@@ -7,13 +7,12 @@
 #![warn(missing_docs)]
 
 use std::{
-    alloc::{self, Layout},
     cell::Cell,
     fmt,
     marker::PhantomData,
     mem,
     pin::Pin,
-    ptr::{self, NonNull},
+    ptr::NonNull,
     sync::atomic::{self, AtomicUsize, Ordering},
 };
 
@@ -171,74 +170,35 @@ impl<T> Bark<T> {
         // atomic operations here are ripped straight from the
         // Rust stdlib's `Arc`, so they should be sound.
         //
-        // This one's a bit neat, though. `compare_exchange` has
-        // an ordering for comparison success and an ordering for
-        // comparison failure. In the case of comparison success,
-        // we want an `Ordering::Release` in order to sync with
-        // the `Acquire` fence following this if statement. But
-        // if the comparison fails, we're not going to drop
-        // anything, so we never hit the fence and can just get
-        // out of here.
+        // In the case of the cmpxchg succeeding, the `Acquire` ordering turns the
+        // `cmpxchg` into a barrier which prevents any of the reads/writes which happen
+        // below, from moving up above the barrier. We do not need a `Release` ordering
+        // on the `cmpxchg` because `try_unwrap` will only succeed if we have the only
+        // `Bark` in the universe, and is thus only in our thread; so the `Release`
+        // in `Drop` will synchronize with our `Acquire` here, ensuring that all modifications
+        // by other threads are seen before our `cmpxchg`.
         if this.thread().get() == 1
             && this
                 .inner()
                 .cross
-                .compare_exchange(1, 0, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
         {
             return Err(this);
         }
 
-        atomic::fence(Ordering::Acquire);
-
-        // The `Release` on our cross-thread refcount prevents any of the reads/writes
-        // our `Arc` after the cmpxchg.
-        //
-        // Meanwhile, in the case of the cmpxchg succeeding, the subsequent `Acquire`
-        // fence turns the `cmpxchg` into a barrier which prevents any of the
-        // reads/writes which happen below, from moving up above the barrier.
-        //
-        // Interestingly, according to the Rust documentation, using `AcqRel` in the
-        // case of `compare_and_exchange` will prevent any form of relaxed accesses.
-        // Using `Ordering::Release`, we ensure that all reads/writes occur before
-        // the cmpxchg barrier, but semantically the successful load comes after;
-        // This means that it can be reordered around reads/writes that come after.
-        // So `AcqRel` on the `cmpxchg` causes the consequent load to have `Acquire`
-        // semantics, which is unnecessary here.
-        //
-        // TODO: Is this actually the case? I know this pattern is valid because it's
-        // what Rust's `Arc` uses and I trust `Arc` since it's been formally verified;
-        // but my analysis may be off. Is the "load" part of the cmpxchg actually
-        // something we don't care about, or is the returned value considered separate
-        // from the information about whether or not we actually succeeded in the compare?
-        //
-        // According to https://www.felixcloutier.com/x86/cmpxchg, on Intel x86/64,
-        // the success information is in the ZF flag and the returned value *is* separate;
-        // so at least on x86, this may be significant, if the processor separates the
-        // two after decoding the instruction. Cool!
-
         unsafe {
-            // We read out the value which was previously inside, without moving it.
-            // Then, we carefully deallocate the box which previously held the value
-            // and our cross-thread refcount, *without* dropping its contents. We have
-            // to do this manually; the code here is based on the example found in
-            // the Rust docs for `Box::into_raw`:
-            //
-            // https://doc.rust-lang.org/std/boxed/struct.Box.html#method.into_raw
-            let elem = ptr::read(&this.inner().value as *const T);
+            // Drop the `BarkInner` and move the value out.
+            let BarkInner { value, .. } = *Box::from_raw(this.inner.as_ptr());
 
-            // This is due to `Box`'s layout. Again, see the `Box::into_raw` example.
-            alloc::dealloc(this.inner.as_ptr() as *mut u8, Layout::new::<T>());
-
-            // There's nothing we need to pull out of the thread-local refcount, so
-            // we can just convert it back to a `Box` and let it go.
+            // We're done with the thread-local refcount too, so we can drop it.
             let _ = Box::from_raw(this.thread.as_ptr());
 
             // We definitely do not want to run our `Drop` implementation now; it'd
             // cause a use-after-free.
             mem::forget(this);
 
-            Ok(elem)
+            Ok(value)
         }
     }
 }
